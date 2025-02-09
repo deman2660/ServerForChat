@@ -1,14 +1,22 @@
 // server.js
+const fs = require("fs");
+const https = require("https");
 const express = require("express");
-const http = require("http");
 const socketIo = require("socket.io");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 
-// Create an Express app and HTTP server.
+// Load SSL certificate
+const options = {
+  key: fs.readFileSync("/etc/letsencrypt/live/robloxchatenhance.duckdns.org/privkey.pem"),
+  cert: fs.readFileSync("/etc/letsencrypt/live/robloxchatenhance.duckdns.org/fullchain.pem"),
+};
+
+// Create an Express app and HTTPS server
 const app = express();
 app.use(express.json()); // For parsing JSON bodies
-const server = http.createServer(app);
+const server = https.createServer(options, app);
+
 const io = socketIo(server, {
   cors: {
     origin: [
@@ -17,7 +25,6 @@ const io = socketIo(server, {
     ]
   }
 });
-
 
 // In-memory storage for connected users and queued messages.
 const activeUsers = new Map();
@@ -33,7 +40,6 @@ const db = new sqlite3.Database("chat.db", (err) => {
 });
 
 // Create the messages table if it doesn't exist.
-// Now includes a "message_type" column (default 'text').
 db.run(
   `CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,9 +77,8 @@ db.run(
 io.on("connection", (socket) => {
   console.log("[Server] New Socket.IO connection established.");
 
-  // Handle registration over Socket.IO.
   socket.on("register", (data, ack) => {
-    const userId = String(data.userId);  // Ensure it's a string
+    const userId = String(data.userId);
     const registeredAt = new Date().toISOString();
     db.run(
       `INSERT OR REPLACE INTO registered_users (user_id, registered_at) VALUES (?, ?)`,
@@ -92,9 +97,8 @@ io.on("connection", (socket) => {
   socket.on("identify", (userId) => {
     const id = String(userId);
     socket.userId = id;
-    activeUsers.set(id, socket); // Save this socket in our activeUsers map.
+    activeUsers.set(id, socket);
     console.log(`[Server] User ${id} identified and online.`);
-    // Deliver queued messages if any.
     if (messageQueues.has(id)) {
       const queuedMessages = messageQueues.get(id);
       queuedMessages.forEach((msg) => socket.emit("message", msg));
@@ -108,7 +112,6 @@ io.on("connection", (socket) => {
     const recipientId = String(data.recipient_user_id);
     const content = data.content;
     const timestamp = data.timestamp;
-    // Determine the message type based on data.image.
     const messageType = data.image ? "image" : "text";
 
     const stmt = db.prepare(
@@ -124,10 +127,8 @@ io.on("connection", (socket) => {
     });
     stmt.finalize();
 
-    // Deliver message if recipient is online.
     const recipientSocket = activeUsers.get(recipientId);
     if (recipientSocket && recipientSocket.connected) {
-      // For live messages, the data sent from the client already includes data.image if applicable.
       recipientSocket.emit("message", data);
       console.log(`[Server] Delivered message to online user ${recipientId}`);
     } else {
@@ -145,67 +146,26 @@ io.on("connection", (socket) => {
     const requestId = data.requestId;
     const fullHistory = data.fullHistory === true;
 
-    console.log(
-      `[Server] Received fetch_history request from ${senderId} for conversation with ${friendId} (requestId: ${requestId}) - fullHistory: ${fullHistory}`
-    );
+    console.log(`[Server] Fetching history for ${senderId} & ${friendId} (full: ${fullHistory})`);
 
-    if (fullHistory) {
-      const query = `
-        SELECT * FROM messages
-        WHERE (sender_user_id = ? AND recipient_user_id = ?)
-           OR (sender_user_id = ? AND recipient_user_id = ?)
-        ORDER BY timestamp ASC
-      `;
-      db.all(query, [senderId, friendId, friendId, senderId], (err, rows) => {
-        if (err) {
-          console.error("[Server] Error fetching history:", err.message);
-          socket.emit("history", { friend_user_id: friendId, history: [], requestId, fullHistory, totalMessages: 0 });
-        } else {
-          // Add an "image" property to each row if message_type is 'image'
-          rows = rows.map(row => {
-            row.image = (row.message_type === "image");
-            return row;
-          });
-          socket.emit("history", { friend_user_id: friendId, history: rows, requestId, fullHistory, totalMessages: rows.length });
-        }
-      });
-    } else {
-      const countQuery = `
-        SELECT COUNT(*) as count FROM messages
-        WHERE (sender_user_id = ? AND recipient_user_id = ?)
-           OR (sender_user_id = ? AND recipient_user_id = ?)
-      `;
-      db.get(countQuery, [senderId, friendId, friendId, senderId], (err, countRow) => {
-        if (err) {
-          console.error("[Server] Error fetching history count:", err.message);
-          socket.emit("history", { friend_user_id: friendId, history: [], requestId, fullHistory, totalMessages: 0 });
-        } else {
-          const totalMessages = countRow.count;
-          const query = `
-            SELECT * FROM (
-              SELECT * FROM messages
-              WHERE (sender_user_id = ? AND recipient_user_id = ?)
-                 OR (sender_user_id = ? AND recipient_user_id = ?)
-              ORDER BY timestamp DESC LIMIT 10
-            ) sub
-            ORDER BY timestamp ASC
-          `;
-          db.all(query, [senderId, friendId, friendId, senderId], (err, rows) => {
-            if (err) {
-              console.error("[Server] Error fetching history:", err.message);
-              socket.emit("history", { friend_user_id: friendId, history: [], requestId, fullHistory, totalMessages });
-            } else {
-              // Add an "image" property to each row if message_type is 'image'
-              rows = rows.map(row => {
-                row.image = (row.message_type === "image");
-                return row;
-              });
-              socket.emit("history", { friend_user_id: friendId, history: rows, requestId, fullHistory, totalMessages });
-            }
-          });
-        }
-      });
-    }
+    const query = `
+      SELECT * FROM messages
+      WHERE (sender_user_id = ? AND recipient_user_id = ?)
+         OR (sender_user_id = ? AND recipient_user_id = ?)
+      ORDER BY timestamp ASC
+    `;
+    db.all(query, [senderId, friendId, friendId, senderId], (err, rows) => {
+      if (err) {
+        console.error("[Server] Error fetching history:", err.message);
+        socket.emit("history", { friend_user_id: friendId, history: [], requestId });
+      } else {
+        rows = rows.map(row => {
+          row.image = (row.message_type === "image");
+          return row;
+        });
+        socket.emit("history", { friend_user_id: friendId, history: rows, requestId });
+      }
+    });
   });
 
   socket.on("get_registered_friends", (data, ack) => {
@@ -220,8 +180,7 @@ io.on("connection", (socket) => {
         console.error("Error fetching registered friends:", err.message);
         return ack({ error: "Database error" });
       }
-      const registeredFriendIds = rows.map(row => row.user_id);
-      ack({ registeredFriendIds });
+      ack({ registeredFriendIds: rows.map(row => row.user_id) });
     });
   });
 
@@ -242,6 +201,5 @@ io.on("connection", (socket) => {
 });
 
 server.listen(8080, () => {
-  console.log("[Server] Socket.IO server running on port 8080");
+  console.log("✅ Secure WebSocket server running on https://robloxchatenhance.duckdns.org:8080");
 });
-console.log("Server initialization complete.");
